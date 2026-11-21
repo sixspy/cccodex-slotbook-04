@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, write_audit
-from locks import release, require_lock
+from locks import slot_lock
 
 router = APIRouter(tags=["holds"])
 
@@ -35,8 +35,7 @@ def create_hold(body: HoldIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
     lock_key = f"slot:{body.slot_code}"
     with connect() as conn:
-        require_lock(conn, lock_key, user)
-        try:
+        with slot_lock(conn, lock_key, user):
             slot = conn.execute(
                 "SELECT * FROM slots WHERE code=?", (body.slot_code,)
             ).fetchone()
@@ -65,7 +64,6 @@ def create_hold(body: HoldIn, authorization: AuthHeader = None):
                     body.party_key,
                     {"slot": body.slot_code, "free": free, "want": body.seats},
                 )
-                conn.commit()
                 return {"disposition": "候补", "free": free}
             cur = conn.execute(
                 """INSERT INTO holds(slot_id,party_key,seats,status,expire_at,created_at)
@@ -79,8 +77,4 @@ def create_hold(body: HoldIn, authorization: AuthHeader = None):
                 body.party_key,
                 {"slot": body.slot_code, "seats": body.seats, "hold_id": cur.lastrowid},
             )
-            conn.commit()
             return {"disposition": "占位", "hold_id": cur.lastrowid, "expire_at": expire}
-        finally:
-            release(conn, lock_key, user)
-            conn.commit()

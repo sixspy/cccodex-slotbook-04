@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS holds(
   status TEXT NOT NULL,
   expire_at TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  wait_id INTEGER,
   FOREIGN KEY(slot_id) REFERENCES slots(id)
 );
 CREATE TABLE IF NOT EXISTS bookings(
@@ -210,9 +211,21 @@ def seed_if_empty(conn) -> None:
     write_audit(conn, "system", "seed", "slots", {"count": len(slots)})
 
 
+def migrate(conn) -> None:
+    """对既有库做增量迁移（CREATE TABLE IF NOT EXISTS 不会补列）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(holds)").fetchall()}
+    if "wait_id" not in cols:
+        conn.execute("ALTER TABLE holds ADD COLUMN wait_id INTEGER")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS ux_holds_wait_id
+           ON holds(wait_id) WHERE wait_id IS NOT NULL"""
+    )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        migrate(conn)
         ensure_users(conn)
         seed_if_empty(conn)
         conn.commit()

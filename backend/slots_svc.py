@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from auth import AuthHeader, require_user, require_writer
 from db import connect, write_audit
-from locks import release, require_lock
+from locks import slot_lock
 
 router = APIRouter(tags=["slots"])
 
@@ -49,8 +49,7 @@ def get_slot(code: str, authorization: AuthHeader = None):
 def create_slot(body: SlotIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
     with connect() as conn:
-        require_lock(conn, f"slot:{body.code}", user)
-        try:
+        with slot_lock(conn, f"slot:{body.code}", user):
             exists = conn.execute(
                 "SELECT id FROM slots WHERE code=?", (body.code,)
             ).fetchone()
@@ -64,10 +63,6 @@ def create_slot(body: SlotIn, authorization: AuthHeader = None):
                 (body.code, body.title, body.start_at, body.end_at, body.capacity),
             )
             write_audit(conn, user, "slot_create", body.code, body.model_dump())
-            conn.commit()
-        finally:
-            release(conn, f"slot:{body.code}", user)
-            conn.commit()
     return {"ok": True, "code": body.code}
 
 
@@ -75,8 +70,7 @@ def create_slot(body: SlotIn, authorization: AuthHeader = None):
 def close_slot(body: CloseIn, authorization: AuthHeader = None):
     user = require_writer(authorization)
     with connect() as conn:
-        require_lock(conn, f"slot:{body.code}", user)
-        try:
+        with slot_lock(conn, f"slot:{body.code}", user):
             row = conn.execute(
                 "SELECT * FROM slots WHERE code=?", (body.code,)
             ).fetchone()
@@ -94,10 +88,6 @@ def close_slot(body: CloseIn, authorization: AuthHeader = None):
                 "UPDATE slots SET status='关闭' WHERE id=?", (row["id"],)
             )
             write_audit(conn, user, "slot_close", body.code, {"generation": row["generation"]})
-            conn.commit()
-        finally:
-            release(conn, f"slot:{body.code}", user)
-            conn.commit()
     return {"ok": True}
 
 

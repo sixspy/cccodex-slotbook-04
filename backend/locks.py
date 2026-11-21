@@ -1,6 +1,11 @@
-"""档期锁与争用登记。"""
+"""档期锁与争用登记。
+
+口径（2026-11-21 锁定）：写路径一律先抢档锁，抢到后用同一连接、同一事务
+完成业务写；失败整笔回滚，后到只记争用痕，不写业务。
+"""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
@@ -16,23 +21,37 @@ class LockIn(BaseModel):
     lock_key: str
 
 
-def try_acquire(conn, lock_key: str, holder: str) -> bool:
-    now = datetime.now().isoformat(timespec="seconds")
-    row = conn.execute(
-        "SELECT holder FROM slot_locks WHERE lock_key=?", (lock_key,)
-    ).fetchone()
-    if row is None:
-        conn.execute(
-            "INSERT INTO slot_locks(lock_key,holder,acquired_at) VALUES (?,?,?)",
-            (lock_key, holder, now),
-        )
-        return True
-    if row["holder"] == holder:
-        return True
+def record_contention(conn, lock_key: str, actor: str, detail: str) -> None:
+    """争用痕单独落库；调用方须自行 commit。"""
     conn.execute(
         """INSERT INTO contention_log(lock_key,actor,action,detail,created_at)
            VALUES (?,?,?,?,?)""",
-        (lock_key, holder, "争用", f"持有者={row['holder']}", now),
+        (
+            lock_key,
+            actor,
+            "争用",
+            detail,
+            datetime.now().isoformat(timespec="seconds"),
+        ),
+    )
+
+
+def try_acquire(conn, lock_key: str, holder: str) -> bool:
+    """原子抢锁：INSERT OR IGNORE 判定归属，避免先查后插的竞态。"""
+    now = datetime.now().isoformat(timespec="seconds")
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO slot_locks(lock_key,holder,acquired_at) VALUES (?,?,?)",
+        (lock_key, holder, now),
+    )
+    if cur.rowcount == 1:
+        return True
+    row = conn.execute(
+        "SELECT holder FROM slot_locks WHERE lock_key=?", (lock_key,)
+    ).fetchone()
+    if row is not None and row["holder"] == holder:
+        return True
+    record_contention(
+        conn, lock_key, holder, f"持有者={row['holder'] if row else '?'}"
     )
     return False
 
@@ -44,9 +63,35 @@ def release(conn, lock_key: str, holder: str) -> None:
     )
 
 
-def require_lock(conn, lock_key: str, holder: str) -> None:
+@contextmanager
+def slot_lock(conn, lock_key: str, holder: str):
+    """持档锁的同事务写窗。
+
+    三段各自成事务，互不夹缠：
+      1) 抢锁单独提交——其他人立刻能看到持有者，撞上就留争用痕；
+      2) 业务写在 with 块内，成功一起提交、异常整笔回滚；
+      3) 退出时释放档锁并提交，失败也不留死锁。
+
+    调用方不得在 with 块内自行 commit/rollback，也不得另开连接写同一档。
+    """
+    # 1) 抢锁：单独提交，保证争用可见、可留痕
     if not try_acquire(conn, lock_key, holder):
+        conn.commit()
         raise HTTPException(409, "争用：后到只记争用，不写业务")
+    conn.commit()
+
+    ok = False
+    try:
+        yield
+        conn.commit()
+        ok = True
+    finally:
+        # 2b) 失败整笔回滚
+        if not ok and conn.in_transaction:
+            conn.rollback()
+        # 3) 释放档锁：用新事务，避免把回滚掉的内容又带出去
+        release(conn, lock_key, holder)
+        conn.commit()
 
 
 @router.get("/api/locks")

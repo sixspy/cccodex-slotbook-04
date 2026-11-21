@@ -76,7 +76,12 @@ createApp({
     }
     async function promoteWait(id) {
       try { actionErr.value = ""; await api.post("/api/waitlist/promote", { wait_id: id }); await refresh(); }
-      catch (e) { actionErr.value = e.message; }
+      catch (e) { actionErr.value = e.message; await refresh(); }
+    }
+    // 只读展示：某候补对应的占位行（凭 wait_id 溯源），用于看双态是否分裂
+    function holdForWait(w) {
+      const h = (holds.value || []).find((x) => x.wait_id === w.id);
+      return h ? `#${h.id} ${h.status}` : "—";
     }
 
     onMounted(() => { if (token.value) refresh(); });
@@ -84,7 +89,7 @@ createApp({
     return {
       token, user, username, password, err, actionErr, tab, nav,
       slots, holds, waitlist, bookings, recon, audits, contention, dash,
-      holdForm, confirmId, login, logout, refresh, doHold, doConfirm, promoteWait,
+      holdForm, confirmId, login, logout, refresh, doHold, doConfirm, promoteWait, holdForWait,
     };
   },
   template: `
